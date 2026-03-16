@@ -1,0 +1,10 @@
+[tools]
+# Stack
+rust = "latest"
+
+# Tools
+opencode = "latest"
+
+[settings]
+experimental = true
+idiomatic_version_file_enable_tools = ["rust"] # Use rust-toolchain.toml

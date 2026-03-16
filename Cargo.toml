@@ -1,0 +1,5 @@
+[package]
+name = "bigbrother"
+version = "0.1.0"
+edition = "2024"
+authors = ["Sasha Koss <koss@nocorp.me>"]
