@@ -4,7 +4,17 @@ rust = "latest"
 
 # Tools
 opencode = "latest"
+oxfmt = "latest"
 
 [settings]
 experimental = true
 idiomatic_version_file_enable_tools = ["rust"] # Use rust-toolchain.toml
+
+[tasks.test]
+run = "cargo test --all-features"
+
+[tasks.format]
+run = "cargo fmt --all"
+
+[tasks.lint]
+run = "cargo clippy --all-features -- -D warnings"
