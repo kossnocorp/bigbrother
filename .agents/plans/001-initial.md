@@ -1,0 +1,10 @@
+- [x] Compare `notify` + `ignore` against `watchexec` + `watchexec_filterer_ignore` for suitability.
+- [x] Research `ignore` internals and behavior around parent ignore handling and global git ignore.
+- [x] Research `ignore-files` capabilities for discovery + compiled ignore filters + global ignore files.
+- [x] Research source-file extension datasets/crates for `only_source` mode.
+- [x] Implement crate API and watcher state machine.
+- [x] Implement initial parallel scan and tracked-set bootstrap.
+- [x] Implement file watching, ignore-file change detection, and matcher rebuild.
+- [x] Implement tracked/untracked diff emission and file event emission.
+- [x] Write unit + integration tests for edge cases and required behavior.
+- [x] Run tests and finalize docs.

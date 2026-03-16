@@ -3,3 +3,21 @@ name = "bigbrother"
 version = "0.1.0"
 edition = "2024"
 authors = ["Sasha Koss <koss@nocorp.me>"]
+
+[features]
+default = []
+source-filter = ["dep:tokei"]
+
+[dependencies]
+anyhow = "1"
+ignore = "0.4"
+ignore-files = "3"
+notify = "8"
+tokei = { version = "14", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }
+
+[dev-dependencies]
+insta = { version = "1", features = ["ron"] }
+pretty_assertions = "1"
+tempfile = "3"
+git2 = "0.20"
