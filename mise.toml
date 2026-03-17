@@ -18,3 +18,6 @@ run = "cargo fmt --all"
 
 [tasks.lint]
 run = "cargo clippy --all-features -- -D warnings"
+
+[tasks.ship]
+run = "cargo publish --allow-dirty"
