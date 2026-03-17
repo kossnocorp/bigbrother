@@ -632,122 +632,74 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
     use std::{collections::BTreeSet, fs, time::Duration};
 
     use git2::Repository;
-    #[cfg(feature = "source-filter")]
-    use insta::assert_ron_snapshot;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
     use tokio::time::timeout;
 
-    fn write(path: &Path, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, content).unwrap();
-    }
-
-    fn git_init(path: &Path) -> Repository {
-        Repository::init(path).unwrap()
-    }
-
-    async fn recv_until(
-        rx: &mut mpsc::Receiver<TrackEvent>,
-        predicate: impl Fn(&TrackEvent) -> bool,
-    ) -> Option<TrackEvent> {
-        let deadline = Duration::from_secs(5);
-        timeout(deadline, async {
-            loop {
-                let ev = rx.recv().await?;
-                if predicate(&ev) {
-                    return Some(ev);
-                }
-            }
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-
     #[test]
     fn test_find_repo_root_from_nested_dir() {
-        let tmp = TempDir::new().unwrap();
-        let _repo = git_init(tmp.path());
+        let repo = TempRepo::new();
 
-        let nested = tmp.path().join("a/b/c");
+        let nested = repo.path().join("a/b/c");
         fs::create_dir_all(&nested).unwrap();
         let found = find_repo_root(&nested).unwrap();
-        assert_eq!(found, tmp.path().to_path_buf());
+        assert_eq!(found, repo.path().to_path_buf());
     }
 
     #[cfg(feature = "source-filter")]
     #[test]
     fn test_only_source_with_tokei() {
-        let values = vec![
-            is_source_file(Path::new("src/main.rs")),
-            is_source_file(Path::new("web/app.ts")),
-            is_source_file(Path::new("docs/readme.unknownext")),
-        ];
-
-        assert_ron_snapshot!(values, @"
-        [
-          true,
-          true,
-          false,
-        ]
-        ");
+        assert!(is_source_file(Path::new("src/main.rs")));
+        assert!(is_source_file(Path::new("web/app.ts")));
+        assert!(!is_source_file(Path::new("docs/readme.unknownext")));
     }
 
     #[cfg(not(feature = "source-filter"))]
     #[test]
     fn test_source_filter_disabled_behavior() {
         assert!(!is_source_file(Path::new("src/main.rs")));
+        assert!(!is_source_file(Path::new("web/app.ts")));
+        assert!(!is_source_file(Path::new("docs/readme.unknownext")));
     }
 
     #[tokio::test]
     async fn test_initial_scan_reports_tracked_files() {
-        let tmp = TempDir::new().unwrap();
-        let _repo = git_init(tmp.path());
+        let repo = TempRepo::new();
+        repo.write_all(vec![
+            (".gitignore", "ignored.tmp\nlogs/\n"),
+            ("root.rs", "fn main() {}\n"),
+            ("src/lib.rs", "pub fn lib() {}\n"),
+            ("ignored.tmp", "skip\n"),
+            ("logs/app.log", "skip\n"),
+        ]);
 
-        write(&tmp.path().join(".gitignore"), "ignored.tmp\nlogs/\n");
-        write(&tmp.path().join("root.rs"), "fn main() {}\n");
-        write(&tmp.path().join("src/lib.rs"), "pub fn lib() {}\n");
-        write(&tmp.path().join("ignored.tmp"), "skip\n");
-        write(&tmp.path().join("logs/app.log"), "skip\n");
+        let (tracker, mut rx) = FileTracker::start(repo.path()).await.unwrap();
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
-
-        let mut initial = BTreeSet::new();
-        while let Ok(Some(ev)) = timeout(Duration::from_millis(50), rx.recv()).await {
-            if let TrackEvent::InitialTracked { path } = ev {
-                initial.insert(path);
-            } else {
-                break;
-            }
-        }
-
-        let expected: BTreeSet<PathBuf> = [
-            PathBuf::from(".gitignore"),
-            PathBuf::from("root.rs"),
-            PathBuf::from("src/lib.rs"),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(initial, expected);
+        let initial = recv_initial(&mut rx).await;
+        assert_eq!(
+            initial,
+            [
+                PathBuf::from(".gitignore"),
+                PathBuf::from("root.rs"),
+                PathBuf::from("src/lib.rs"),
+            ]
+            .into()
+        );
 
         tracker.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_start_with_options_works() {
-        let tmp = TempDir::new().unwrap();
-        let _repo = git_init(tmp.path());
-
-        write(&tmp.path().join("main.rs"), "fn main() {}\n");
+        let repo = TempRepo::new();
+        repo.write("main.rs", "fn main() {}\n");
 
         let (tracker, mut rx) = FileTracker::start_with_options(
-            tmp.path(),
+            repo.path(),
             WatchOptions {
                 settle_delay: Duration::from_millis(10),
                 event_channel_capacity: 16,
@@ -769,29 +721,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_ignore_change_unignores_file() {
-        let tmp = TempDir::new().unwrap();
-        let _repo = git_init(tmp.path());
+        let repo = TempRepo::new();
+        repo.write_all(vec![
+            (".gitignore", "ignored.txt\n"),
+            ("ignored.txt", "hello"),
+            ("tracked.rs", "fn main() {}\n"),
+        ]);
 
-        write(&tmp.path().join(".gitignore"), "ignored.txt\n");
-        write(&tmp.path().join("ignored.txt"), "hello");
-        write(&tmp.path().join("tracked.rs"), "fn main() {}\n");
+        let (tracker, mut rx) = FileTracker::start(repo.path()).await.unwrap();
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
-
-        let mut initial = BTreeSet::new();
-        while let Ok(Some(ev)) = timeout(Duration::from_millis(50), rx.recv()).await {
-            if let TrackEvent::InitialTracked { path } = ev {
-                initial.insert(path);
-            } else {
-                break;
-            }
-        }
-
+        let initial = recv_initial(&mut rx).await;
         assert!(initial.contains(&PathBuf::from("tracked.rs")));
         assert!(!initial.contains(&PathBuf::from("ignored.txt")));
 
-        write(&tmp.path().join(".gitignore"), "");
-
+        repo.write(".gitignore", "");
         let tracked = recv_until(
             &mut rx,
             |ev| matches!(ev, TrackEvent::Tracked { path } if path == Path::new("ignored.txt")),
@@ -804,17 +747,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_nested_cwd_observes_repo_root_ignore_changes() {
-        let tmp = TempDir::new().unwrap();
-        let _repo = git_init(tmp.path());
+        let repo = TempRepo::new();
+        repo.write_all(vec![
+            (".gitignore", ""),
+            ("app/a.log", "x\n"),
+            ("app/main.rs", "fn main() {}\n"),
+        ]);
 
-        write(&tmp.path().join(".gitignore"), "");
-        write(&tmp.path().join("app/a.log"), "x\n");
-        write(&tmp.path().join("app/main.rs"), "fn main() {}\n");
+        let (tracker, mut rx) = FileTracker::start(repo.path().join("app")).await.unwrap();
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path().join("app")).await.unwrap();
-
-        write(&tmp.path().join(".gitignore"), "*.log\n");
-
+        repo.write(".gitignore", "*.log\n");
         let untracked = recv_until(
             &mut rx,
             |ev| matches!(ev, TrackEvent::Untracked { path } if path == Path::new("a.log")),
@@ -822,8 +764,7 @@ mod tests {
         .await;
         assert!(untracked.is_some());
 
-        write(&tmp.path().join(".gitignore"), "");
-
+        repo.write(".gitignore", "");
         let tracked = recv_until(
             &mut rx,
             |ev| matches!(ev, TrackEvent::Tracked { path } if path == Path::new("a.log")),
@@ -836,22 +777,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_global_ignore_via_core_excludes_file_changes() {
-        let tmp = TempDir::new().unwrap();
-        let repo = git_init(tmp.path());
+        let repo = TempRepo::new();
+        repo.write_all(vec![
+            ("global-excludes", "global.txt\n"),
+            ("global.txt", "x\n"),
+        ]);
+        repo.set_excludes_file("global-excludes");
 
-        let excludes = tmp.path().join("global-excludes");
-        write(&excludes, "global.txt\n");
-        let mut config = repo.config().unwrap();
-        config
-            .set_str("core.excludesFile", &excludes.to_string_lossy())
-            .unwrap();
+        let (tracker, mut rx) = FileTracker::start(repo.path()).await.unwrap();
 
-        write(&tmp.path().join("global.txt"), "x\n");
+        let initial = recv_initial(&mut rx).await;
+        assert!(!initial.contains(&PathBuf::from("global.txt")));
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
-
-        write(&excludes, "");
-
+        repo.write("global-excludes", "");
         let tracked = recv_until(
             &mut rx,
             |ev| matches!(ev, TrackEvent::Tracked { path } if path == Path::new("global.txt")),
@@ -864,14 +802,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_remove_and_move_events() {
-        let tmp = TempDir::new().unwrap();
-        let _repo = git_init(tmp.path());
+        let repo = TempRepo::new();
+        repo.write("main.rs", "fn main() {}\n");
 
-        write(&tmp.path().join("main.rs"), "fn main() {}\n");
+        let (tracker, mut rx) = FileTracker::start(repo.path()).await.unwrap();
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
-
-        write(&tmp.path().join("new.rs"), "pub fn x() {}\n");
+        repo.write("new.rs", "pub fn x() {}\n");
         let created = recv_until(
             &mut rx,
             |ev| matches!(ev, TrackEvent::Created { path } if path == Path::new("new.rs")),
@@ -879,7 +815,7 @@ mod tests {
         .await;
         assert!(created.is_some());
 
-        fs::rename(tmp.path().join("new.rs"), tmp.path().join("moved.rs")).unwrap();
+        fs::rename(repo.path().join("new.rs"), repo.path().join("moved.rs")).unwrap();
         let moved = recv_until(
             &mut rx,
             |ev| {
@@ -889,7 +825,7 @@ mod tests {
         .await;
         assert!(moved.is_some());
 
-        fs::remove_file(tmp.path().join("moved.rs")).unwrap();
+        fs::remove_file(repo.path().join("moved.rs")).unwrap();
         let removed = recv_until(
             &mut rx,
             |ev| matches!(ev, TrackEvent::Removed { path } if path == Path::new("moved.rs")),
@@ -898,5 +834,151 @@ mod tests {
         assert!(removed.is_some());
 
         tracker.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mid_path_gitignore() {
+        let repo = TempRepo::new();
+
+        repo.write_all(vec![
+            ("path/to/file/.gitignore", "/a.txt\n"),
+            ("path/to/file/a.txt", ""),
+            ("path/to/file/b.txt", ""),
+            ("path/to/file/c.txt", ""),
+            ("path/to/file/d.txt", ""),
+            ("path/to/a.txt", ""),
+            ("path/to/b.txt", ""),
+            ("path/to/c.txt", ""),
+            ("path/to/d.txt", ""),
+            (".gitignore", "d.txt\n"),
+        ]);
+
+        let (tracker, mut rx) = FileTracker::start(repo.path()).await.unwrap();
+
+        let initial = recv_initial(&mut rx).await;
+
+        assert_eq!(
+            initial,
+            [
+                ".gitignore".into(),
+                "path/to/file/b.txt".into(),
+                "path/to/file/c.txt".into(),
+                "path/to/file/.gitignore".into(),
+                "path/to/a.txt".into(),
+                "path/to/b.txt".into(),
+                "path/to/c.txt".into(),
+            ]
+            .into()
+        );
+
+        repo.write("path/to/.gitignore", "a.txt\n/b.txt\nc.txt\n");
+
+        let untracked_a = recv_until(
+            &mut rx,
+            |ev| matches!(ev, TrackEvent::Untracked { path } if path == Path::new("path/to/a.txt")),
+        )
+        .await;
+        assert!(untracked_a.is_some());
+
+        let untracked_b = recv_until(
+            &mut rx,
+            |ev| matches!(ev, TrackEvent::Untracked { path } if path == Path::new("path/to/b.txt")),
+        )
+        .await;
+        assert!(untracked_b.is_some());
+
+        let untracked_c = recv_until(
+            &mut rx,
+            |ev| matches!(ev, TrackEvent::Untracked { path } if path == Path::new("path/to/c.txt")),
+        )
+        .await;
+        assert!(untracked_c.is_some());
+
+        let mut saw_wrong_untrack = false;
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(300), rx.recv()).await {
+            if matches!(ev, TrackEvent::Untracked { path } if path == Path::new("path/to/file/b.txt"))
+            {
+                saw_wrong_untrack = true;
+                break;
+            }
+        }
+        assert!(!saw_wrong_untrack);
+
+        tracker.stop().await.unwrap();
+    }
+
+    async fn recv_until(
+        rx: &mut mpsc::Receiver<TrackEvent>,
+        predicate: impl Fn(&TrackEvent) -> bool,
+    ) -> Option<TrackEvent> {
+        let deadline = Duration::from_secs(5);
+        timeout(deadline, async {
+            loop {
+                let ev = rx.recv().await?;
+                if predicate(&ev) {
+                    return Some(ev);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn recv_initial(rx: &mut mpsc::Receiver<TrackEvent>) -> BTreeSet<PathBuf> {
+        let mut initial = BTreeSet::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(50), rx.recv()).await {
+            if let TrackEvent::InitialTracked { path } = ev {
+                initial.insert(path);
+            } else {
+                break;
+            }
+        }
+        initial
+    }
+
+    struct TempRepo {
+        dir: TempDir,
+        repo: Repository,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let repo = Repository::init(dir.path()).unwrap();
+            Self { dir, repo }
+        }
+
+        fn write<P: AsRef<Path>>(&self, path: P, content: &str) {
+            let full_path = self.dir.path().join(path.as_ref());
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(full_path, content).unwrap();
+        }
+
+        fn write_all<P: AsRef<Path>>(&self, paths: Vec<(P, &str)>) {
+            for (path, content) in paths {
+                self.write(path, content);
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn config(&self) -> git2::Config {
+            self.repo.config().unwrap()
+        }
+
+        fn set_excludes_file(&self, path: &str) {
+            let mut config = self.config();
+            config
+                .set_str(
+                    "core.excludesFile",
+                    &self.dir.path().join(path).to_string_lossy(),
+                )
+                .unwrap();
+        }
     }
 }

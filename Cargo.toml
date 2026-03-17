@@ -19,7 +19,6 @@ tokei = { version = "14", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }
 
 [dev-dependencies]
-insta = { version = "1", features = ["ron"] }
 pretty_assertions = "1"
 tempfile = "3"
 git2 = "0.20"
