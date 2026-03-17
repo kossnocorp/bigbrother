@@ -1,7 +1,7 @@
 [package]
 name = "bigbrother"
 description = "Git-aware file tracker (list & watch) for async Rust apps"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Sasha Koss <koss@nocorp.me>"]
 license = "MIT"
