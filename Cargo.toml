@@ -15,6 +15,7 @@ anyhow = "1"
 ignore = "0.4"
 ignore-files = "3"
 notify = "8"
+notify-debouncer-full = "0.7.0"
 tokei = { version = "14", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time"] }
 
@@ -22,3 +23,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", 
 pretty_assertions = "1"
 tempfile = "3"
 git2 = "0.20"
+test-context = "0.5.5"

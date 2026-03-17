@@ -7,16 +7,17 @@ opencode = "latest"
 oxfmt = "latest"
 cargo-binstall = "latest"
 "cargo:watchexec-cli" = "latest"
+"cargo:cargo-nextest" = "latest"
 
 [settings]
 experimental = true
 idiomatic_version_file_enable_tools = ["rust"] # Use rust-toolchain.toml
 
 [tasks.test]
-run = "cargo test --all-features"
+run = "cargo nextest run --all-features"
 
 [tasks."test:watch"]
-run = "watchexec -e rs cargo test --all-features"
+run = "watchexec -e rs cargo nextest run --all-features"
 
 [tasks.format]
 run = "cargo fmt --all"
