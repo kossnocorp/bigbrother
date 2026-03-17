@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -71,8 +71,17 @@ pub enum TrackEvent {
 pub struct FileTracker {
     pub cwd: PathBuf,
     pub repo_dir: Option<PathBuf>,
+    command_tx: mpsc::Sender<TrackerCommand>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum TrackerCommand {
+    IsTracked {
+        path: PathBuf,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 impl FileTracker {
@@ -88,7 +97,7 @@ impl FileTracker {
         let repo_dir = find_repo_root(&cwd);
         let watch_root = repo_dir.clone().unwrap_or_else(|| cwd.clone());
 
-        let state = TrackerState::new(cwd.clone(), watch_root, options).await?;
+        let state = TrackerState::new(cwd.clone(), watch_root, options.clone()).await?;
 
         let (events_tx, events_rx) = mpsc::channel(state.options.event_channel_capacity);
         for rel in sorted_rel_paths(&state.cwd, &state.tracked) {
@@ -98,9 +107,10 @@ impl FileTracker {
         }
 
         let (stop_tx, stop_rx) = oneshot::channel();
+        let (command_tx, command_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            if let Err(err) = run_tracker_loop(state, events_tx, stop_rx, ready_tx).await {
+            if let Err(err) = run_tracker_loop(state, events_tx, command_rx, stop_rx, ready_tx).await {
                 eprintln!("tracker loop failed: {err:#}");
             }
         });
@@ -111,11 +121,27 @@ impl FileTracker {
             Self {
                 cwd,
                 repo_dir,
+                command_tx,
                 stop_tx: Some(stop_tx),
                 task: Some(task),
             },
             events_rx,
         ))
+    }
+
+    pub async fn is_tracked(&self, path: impl AsRef<Path>) -> Result<bool> {
+        let abs = absolute_or_join(&self.cwd, path.as_ref());
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(TrackerCommand::IsTracked {
+                path: abs,
+                reply: reply_tx,
+            })
+            .await
+            .context("tracker is not running")?;
+
+        reply_rx.await.context("tracker task stopped before replying")
     }
 
     pub async fn stop(mut self) -> Result<()> {
@@ -145,6 +171,13 @@ struct TrackerState {
     ignore_filter: IgnoreFilter,
     tracked: HashSet<PathBuf>,
     ignore_files: HashSet<PathBuf>,
+    segment_readiness: HashMap<PathBuf, SegmentReadiness>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentReadiness {
+    Ready,
+    Dirty,
 }
 
 impl TrackerState {
@@ -156,11 +189,12 @@ impl TrackerState {
 
         Ok(Self {
             cwd,
-            watch_root,
+            watch_root: watch_root.clone(),
             options,
             ignore_filter,
             tracked,
             ignore_files,
+            segment_readiness: HashMap::from([(watch_root.clone(), SegmentReadiness::Ready)]),
         })
     }
 
@@ -179,14 +213,95 @@ impl TrackerState {
         self.ignore_filter = ignore_filter;
         self.ignore_files = ignore_files;
         self.tracked = tracked.clone();
+        for readiness in self.segment_readiness.values_mut() {
+            *readiness = SegmentReadiness::Ready;
+        }
 
         Ok((old, tracked))
+    }
+
+    fn needs_rebuild_for_query(&self, path: &Path) -> bool {
+        for segment in self.path_segments(path) {
+            if self
+                .segment_readiness
+                .get(&segment)
+                .is_none_or(|state| *state != SegmentReadiness::Ready)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn mark_path_ready(&mut self, path: &Path) {
+        for segment in self.path_segments(path) {
+            self.segment_readiness
+                .insert(segment, SegmentReadiness::Ready);
+        }
+    }
+
+    fn mark_dirty_for_ignore_change(&mut self, path: &Path) {
+        let abs = absolute_or_join(&self.watch_root, path);
+
+        if abs.to_string_lossy().ends_with(&format!(
+            "{0}.git{0}info{0}exclude",
+            std::path::MAIN_SEPARATOR
+        ))
+            || (abs.file_name().is_some_and(|n| n == "config")
+                && abs
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|n| n == ".git"))
+        {
+            for readiness in self.segment_readiness.values_mut() {
+                *readiness = SegmentReadiness::Dirty;
+            }
+            return;
+        }
+
+        let Some(parent) = abs.parent() else {
+            return;
+        };
+
+        let parent = parent.to_path_buf();
+        for (segment, readiness) in &mut self.segment_readiness {
+            if segment.starts_with(&parent) {
+                *readiness = SegmentReadiness::Dirty;
+            }
+        }
+    }
+
+    fn path_segments(&self, path: &Path) -> Vec<PathBuf> {
+        if !path.starts_with(&self.watch_root) {
+            return Vec::new();
+        }
+
+        let mut segments = Vec::new();
+        let mut current = path.parent();
+        while let Some(dir) = current {
+            if dir.starts_with(&self.watch_root) {
+                segments.push(dir.to_path_buf());
+            } else {
+                break;
+            }
+
+            if dir == self.watch_root {
+                break;
+            }
+
+            current = dir.parent();
+        }
+
+        segments.reverse();
+        segments
     }
 }
 
 async fn run_tracker_loop(
     mut state: TrackerState,
     events_tx: mpsc::Sender<TrackEvent>,
+    mut command_rx: mpsc::Receiver<TrackerCommand>,
     mut stop_rx: oneshot::Receiver<()>,
     ready_tx: oneshot::Sender<()>,
 ) -> Result<()> {
@@ -210,40 +325,111 @@ async fn run_tracker_loop(
             _ = &mut stop_rx => {
                 break;
             }
+            maybe_command = command_rx.recv() => {
+                match maybe_command {
+                    Some(TrackerCommand::IsTracked { path, reply }) => {
+                        tokio::select! {
+                            _ = time::sleep(state.options.settle_delay) => {}
+                            maybe_event = raw_rx.recv() => {
+                                if let Some(event_result) = maybe_event {
+                                    handle_notify_result(
+                                        &mut state,
+                                        &events_tx,
+                                        &mut watcher,
+                                        &mut aux_watches,
+                                        event_result,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+
+                        if state.needs_rebuild_for_query(&path)
+                            && let Ok((old, new)) = state.rebuild().await
+                        {
+                            emit_diff_events(&events_tx, &state.cwd, &old, &new).await;
+                            if let Err(err) = refresh_aux_watches(&state, &mut watcher, &mut aux_watches) {
+                                let _ = events_tx.send(TrackEvent::Error { message: err.to_string() }).await;
+                            }
+                        }
+
+                        state.mark_path_ready(&path);
+
+                        let _ = reply.send(state.tracked.contains(&path));
+                    }
+                    None => {
+                        // No more command senders; continue serving filesystem events.
+                    }
+                }
+            }
             maybe_event = raw_rx.recv() => {
                 let Some(event_result) = maybe_event else {
                     break;
                 };
-
-                match event_result {
-                    Ok(event) => {
-                        if event.paths.iter().any(|p| is_ignore_related_path(p, &state)) {
-                            time::sleep(state.options.settle_delay).await;
-                            match state.rebuild().await {
-                                Ok((old, new)) => {
-                                    emit_diff_events(&events_tx, &state.cwd, &old, &new).await;
-                                    if let Err(err) = refresh_aux_watches(&state, &mut watcher, &mut aux_watches) {
-                                        let _ = events_tx.send(TrackEvent::Error { message: err.to_string() }).await;
-                                    }
-                                }
-                                Err(err) => {
-                                    let _ = events_tx.send(TrackEvent::Error { message: err.to_string() }).await;
-                                }
-                            }
-                            continue;
-                        }
-
-                        process_fs_event(&mut state, &events_tx, event).await;
-                    }
-                    Err(err) => {
-                        let _ = events_tx.send(TrackEvent::Error { message: err.to_string() }).await;
-                    }
-                }
+                handle_notify_result(
+                    &mut state,
+                    &events_tx,
+                    &mut watcher,
+                    &mut aux_watches,
+                    event_result,
+                )
+                .await;
             }
         }
     }
 
     Ok(())
+}
+
+async fn handle_notify_result(
+    state: &mut TrackerState,
+    events_tx: &mpsc::Sender<TrackEvent>,
+    watcher: &mut RecommendedWatcher,
+    aux_watches: &mut HashSet<PathBuf>,
+    event_result: notify::Result<notify::Event>,
+) {
+    match event_result {
+        Ok(event) => {
+            if event.paths.iter().any(|p| is_ignore_related_path(p, state)) {
+                for path in &event.paths {
+                    if is_ignore_related_path(path, state) {
+                        state.mark_dirty_for_ignore_change(path);
+                    }
+                }
+
+                time::sleep(state.options.settle_delay).await;
+                match state.rebuild().await {
+                    Ok((old, new)) => {
+                        emit_diff_events(events_tx, &state.cwd, &old, &new).await;
+                        if let Err(err) = refresh_aux_watches(state, watcher, aux_watches) {
+                            let _ = events_tx
+                                .send(TrackEvent::Error {
+                                    message: err.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = events_tx
+                            .send(TrackEvent::Error {
+                                message: err.to_string(),
+                            })
+                            .await;
+                    }
+                }
+                return;
+            }
+
+            process_fs_event(state, events_tx, event).await;
+        }
+        Err(err) => {
+            let _ = events_tx
+                .send(TrackEvent::Error {
+                    message: err.to_string(),
+                })
+                .await;
+        }
+    }
 }
 
 async fn process_fs_event(
@@ -903,6 +1089,31 @@ mod tests {
             }
         }
         assert!(!saw_wrong_untrack);
+
+        tracker.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_is_tracked_reflects_ignore_changes() {
+        let repo = TempRepo::new();
+        repo.write_all(vec![
+            (".gitignore", "a.txt\nb.txt\n"),
+            ("a.txt", "a\n"),
+            ("b.txt", "b\n"),
+        ]);
+
+        let (tracker, _rx) = FileTracker::start(repo.path()).await.unwrap();
+
+        assert!(!tracker.is_tracked("a.txt").await.unwrap());
+        assert!(!tracker.is_tracked("b.txt").await.unwrap());
+
+        repo.write(".gitignore", "b.txt\n");
+        assert!(tracker.is_tracked("a.txt").await.unwrap());
+        assert!(!tracker.is_tracked("b.txt").await.unwrap());
+
+        repo.write(".gitignore", "a.txt\n");
+        assert!(!tracker.is_tracked("a.txt").await.unwrap());
+        assert!(tracker.is_tracked("b.txt").await.unwrap());
 
         tracker.stop().await.unwrap();
     }
