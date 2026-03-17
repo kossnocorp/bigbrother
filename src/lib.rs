@@ -76,7 +76,11 @@ pub struct FileTracker {
 }
 
 impl FileTracker {
-    pub async fn start(
+    pub async fn start(cwd: impl AsRef<Path>) -> Result<(Self, mpsc::Receiver<TrackEvent>)> {
+        Self::start_with_options(cwd, WatchOptions::default()).await
+    }
+
+    pub async fn start_with_options(
         cwd: impl AsRef<Path>,
         options: WatchOptions,
     ) -> Result<(Self, mpsc::Receiver<TrackEvent>)> {
@@ -702,6 +706,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initial_scan_reports_tracked_files() {
+        let tmp = TempDir::new().unwrap();
+        let _repo = git_init(tmp.path());
+
+        write(&tmp.path().join(".gitignore"), "ignored.tmp\nlogs/\n");
+        write(&tmp.path().join("root.rs"), "fn main() {}\n");
+        write(&tmp.path().join("src/lib.rs"), "pub fn lib() {}\n");
+        write(&tmp.path().join("ignored.tmp"), "skip\n");
+        write(&tmp.path().join("logs/app.log"), "skip\n");
+
+        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
+
+        let mut initial = BTreeSet::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(50), rx.recv()).await {
+            if let TrackEvent::InitialTracked { path } = ev {
+                initial.insert(path);
+            } else {
+                break;
+            }
+        }
+
+        let expected: BTreeSet<PathBuf> = [
+            PathBuf::from(".gitignore"),
+            PathBuf::from("root.rs"),
+            PathBuf::from("src/lib.rs"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(initial, expected);
+
+        tracker.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_with_options_works() {
+        let tmp = TempDir::new().unwrap();
+        let _repo = git_init(tmp.path());
+
+        write(&tmp.path().join("main.rs"), "fn main() {}\n");
+
+        let (tracker, mut rx) = FileTracker::start_with_options(
+            tmp.path(),
+            WatchOptions {
+                settle_delay: Duration::from_millis(10),
+                event_channel_capacity: 16,
+                ..WatchOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let initial = recv_until(
+            &mut rx,
+            |ev| matches!(ev, TrackEvent::InitialTracked { path } if path == Path::new("main.rs")),
+        )
+        .await;
+        assert!(initial.is_some());
+
+        tracker.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_ignore_change_unignores_file() {
         let tmp = TempDir::new().unwrap();
         let _repo = git_init(tmp.path());
@@ -710,9 +776,7 @@ mod tests {
         write(&tmp.path().join("ignored.txt"), "hello");
         write(&tmp.path().join("tracked.rs"), "fn main() {}\n");
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path(), WatchOptions::default())
-            .await
-            .unwrap();
+        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
 
         let mut initial = BTreeSet::new();
         while let Ok(Some(ev)) = timeout(Duration::from_millis(50), rx.recv()).await {
@@ -747,9 +811,7 @@ mod tests {
         write(&tmp.path().join("app/a.log"), "x\n");
         write(&tmp.path().join("app/main.rs"), "fn main() {}\n");
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path().join("app"), WatchOptions::default())
-            .await
-            .unwrap();
+        let (tracker, mut rx) = FileTracker::start(tmp.path().join("app")).await.unwrap();
 
         write(&tmp.path().join(".gitignore"), "*.log\n");
 
@@ -786,9 +848,7 @@ mod tests {
 
         write(&tmp.path().join("global.txt"), "x\n");
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path(), WatchOptions::default())
-            .await
-            .unwrap();
+        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
 
         write(&excludes, "");
 
@@ -809,9 +869,7 @@ mod tests {
 
         write(&tmp.path().join("main.rs"), "fn main() {}\n");
 
-        let (tracker, mut rx) = FileTracker::start(tmp.path(), WatchOptions::default())
-            .await
-            .unwrap();
+        let (tracker, mut rx) = FileTracker::start(tmp.path()).await.unwrap();
 
         write(&tmp.path().join("new.rs"), "pub fn x() {}\n");
         let created = recv_until(
