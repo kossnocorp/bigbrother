@@ -949,19 +949,56 @@ mod tests {
     }
 
     #[cfg(feature = "source-filter")]
-    #[test]
-    fn test_only_source_with_tokei() {
-        assert!(is_source_file(Path::new("src/main.rs")));
-        assert!(is_source_file(Path::new("web/app.ts")));
-        assert!(!is_source_file(Path::new("docs/readme.unknownext")));
+    #[test_context(RepoContext)]
+    #[tokio::test]
+    async fn test_source_filter_enabled_behavior_filter_off(ctx: &mut RepoContext) {
+        ctx.repo
+            .write_all(vec![("file", ""), ("file.bin", ""), ("file.js", "")]);
+
+        ctx.repo.start().await;
+        assert_events!(
+            ctx.repo,
+            initial_ev("file"),
+            initial_ev("file.bin"),
+            initial_ev("file.js"),
+        );
+    }
+
+    #[cfg(feature = "source-filter")]
+    #[test_context(RepoContext)]
+    #[tokio::test]
+    async fn test_source_filter_enabled_behavior_filter_on(ctx: &mut RepoContext) {
+        ctx.repo
+            .write_all(vec![("file", ""), ("file.bin", ""), ("file.js", "")]);
+
+        ctx.repo
+            .start_with_options(WatchOptions {
+                only_source: true,
+                ..WatchOptions::default()
+            })
+            .await;
+        assert_events!(ctx.repo, initial_ev("file.js"),);
     }
 
     #[cfg(not(feature = "source-filter"))]
-    #[test]
-    fn test_source_filter_disabled_behavior() {
-        assert!(!is_source_file(Path::new("src/main.rs")));
-        assert!(!is_source_file(Path::new("web/app.ts")));
-        assert!(!is_source_file(Path::new("docs/readme.unknownext")));
+    #[test_context(RepoContext)]
+    #[tokio::test]
+    async fn test_source_filter_disabled_behavior(ctx: &mut RepoContext) {
+        ctx.repo.write_all(vec![
+            ("file", ""),
+            ("file.bin", ""),
+            ("file.zip", ""),
+            ("file.js", ""),
+        ]);
+
+        ctx.repo.start().await;
+        assert_events!(
+            ctx.repo,
+            initial_ev("file"),
+            initial_ev("file.bin"),
+            initial_ev("file.zip"),
+            initial_ev("file.js"),
+        );
     }
 
     #[test_context(RepoContext)]
