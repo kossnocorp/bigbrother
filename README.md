@@ -49,7 +49,9 @@ Here's a high-level overview of how Big Brother works:
 Basic usage:
 
 ```rs
-use bigbrother::{FileTracker, TrackEvent, WatchOptions};
+use bigbrother::{
+    FileTracker, TrackEvent, TrackEventError, TrackEventFile, TrackEventFileMove, WatchOptions,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -57,16 +59,16 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(event) = rx.recv().await {
         match event {
-            TrackEvent::InitialTracked { path } => println!("initial: {}", path.display()),
-            TrackEvent::Tracked { path } => println!("tracked: {}", path.display()),
-            TrackEvent::Untracked { path } => println!("untracked: {}", path.display()),
-            TrackEvent::Created { path } => println!("created: {}", path.display()),
-            TrackEvent::Changed { path } => println!("changed: {}", path.display()),
-            TrackEvent::Removed { path } => println!("removed: {}", path.display()),
-            TrackEvent::Moved { from, to } => {
+            TrackEvent::InitialTracked(TrackEventFile { path }) => println!("initial: {}", path.display()),
+            TrackEvent::Tracked(TrackEventFile { path }) => println!("tracked: {}", path.display()),
+            TrackEvent::Untracked(TrackEventFile { path }) => println!("untracked: {}", path.display()),
+            TrackEvent::Created(TrackEventFile { path }) => println!("created: {}", path.display()),
+            TrackEvent::Changed(TrackEventFile { path }) => println!("changed: {}", path.display()),
+            TrackEvent::Removed(TrackEventFile { path }) => println!("removed: {}", path.display()),
+            TrackEvent::Moved(TrackEventFileMove { from, to }) => {
                 println!("moved: {} -> {}", from.display(), to.display())
             }
-            TrackEvent::Error { message } => eprintln!("error: {message}"),
+            TrackEvent::Error(TrackEventError { message }) => eprintln!("error: {message}"),
         }
     }
 

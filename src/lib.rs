@@ -60,14 +60,30 @@ impl WatchOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackEvent {
-    InitialTracked { path: PathBuf },
-    Tracked { path: PathBuf },
-    Untracked { path: PathBuf },
-    Created { path: PathBuf },
-    Changed { path: PathBuf },
-    Removed { path: PathBuf },
-    Moved { from: PathBuf, to: PathBuf },
-    Error { message: String },
+    InitialTracked(TrackEventFile),
+    Tracked(TrackEventFile),
+    Untracked(TrackEventFile),
+    Created(TrackEventFile),
+    Changed(TrackEventFile),
+    Removed(TrackEventFile),
+    Moved(TrackEventFileMove),
+    Error(TrackEventError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackEventFile {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackEventFileMove {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackEventError {
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -105,7 +121,7 @@ impl FileTracker {
         let (events_tx, events_rx) = mpsc::channel(state.options.event_channel_capacity);
         for rel in sorted_rel_paths(&state.cwd, &state.tracked) {
             let _ = events_tx
-                .send(TrackEvent::InitialTracked { path: rel })
+                .send(TrackEvent::InitialTracked(TrackEventFile { path: rel }))
                 .await;
         }
 
@@ -359,7 +375,7 @@ async fn run_tracker_loop(
                         {
                             emit_diff_events(&events_tx, &state.cwd, &old, &new).await;
                             if let Err(err) = refresh_aux_watches(&state, &mut watcher, &mut aux_watches) {
-                                let _ = events_tx.send(TrackEvent::Error { message: err.to_string() }).await;
+                                let _ = events_tx.send(TrackEvent::Error(TrackEventError { message: err.to_string() })).await;
                             }
                         }
 
@@ -439,17 +455,17 @@ async fn handle_debounced_result<W: WatchControl>(
                         .await;
                         if let Err(err) = refresh_aux_watches(state, watcher, aux_watches) {
                             let _ = events_tx
-                                .send(TrackEvent::Error {
+                                .send(TrackEvent::Error(TrackEventError {
                                     message: err.to_string(),
-                                })
+                                }))
                                 .await;
                         }
                     }
                     Err(err) => {
                         let _ = events_tx
-                            .send(TrackEvent::Error {
+                            .send(TrackEvent::Error(TrackEventError {
                                 message: err.to_string(),
-                            })
+                            }))
                             .await;
                     }
                 }
@@ -458,9 +474,9 @@ async fn handle_debounced_result<W: WatchControl>(
         Err(errors) => {
             for err in errors {
                 let _ = events_tx
-                    .send(TrackEvent::Error {
+                    .send(TrackEvent::Error(TrackEventError {
                         message: err.to_string(),
-                    })
+                    }))
                     .await;
             }
         }
@@ -494,9 +510,9 @@ async fn process_fs_event(
             EventKind::Remove(_) => {
                 if state.tracked.remove(&abs) {
                     let _ = events_tx
-                        .send(TrackEvent::Removed {
+                        .send(TrackEvent::Removed(TrackEventFile {
                             path: to_relative(&state.cwd, &abs),
-                        })
+                        }))
                         .await;
                 }
             }
@@ -509,9 +525,9 @@ async fn process_fs_event(
                 ) && state.tracked.insert(abs.clone())
                 {
                     let _ = events_tx
-                        .send(TrackEvent::Created {
+                        .send(TrackEvent::Created(TrackEventFile {
                             path: to_relative(&state.cwd, &abs),
-                        })
+                        }))
                         .await;
                 }
             }
@@ -531,18 +547,18 @@ async fn process_fs_event(
                 ) && state.tracked.insert(abs.clone())
                 {
                     let _ = events_tx
-                        .send(TrackEvent::Created {
+                        .send(TrackEvent::Created(TrackEventFile {
                             path: to_relative(&state.cwd, &abs),
-                        })
+                        }))
                         .await;
                 }
             }
             EventKind::Modify(_) => {
                 if state.tracked.contains(&abs) {
                     let _ = events_tx
-                        .send(TrackEvent::Changed {
+                        .send(TrackEvent::Changed(TrackEventFile {
                             path: to_relative(&state.cwd, &abs),
-                        })
+                        }))
                         .await;
                 } else if is_tracked_file(
                     &state.cwd,
@@ -552,9 +568,9 @@ async fn process_fs_event(
                 ) && state.tracked.insert(abs.clone())
                 {
                     let _ = events_tx
-                        .send(TrackEvent::Created {
+                        .send(TrackEvent::Created(TrackEventFile {
                             path: to_relative(&state.cwd, &abs),
-                        })
+                        }))
                         .await;
                 }
             }
@@ -567,9 +583,9 @@ async fn flush_pending_rename_from(state: &mut TrackerState, events_tx: &mpsc::S
     while let Some(from) = state.pending_rename_from.pop_front() {
         if state.tracked.remove(&from) {
             let _ = events_tx
-                .send(TrackEvent::Removed {
+                .send(TrackEvent::Removed(TrackEventFile {
                     path: to_relative(&state.cwd, &from),
-                })
+                }))
                 .await;
         }
     }
@@ -600,24 +616,24 @@ async fn handle_rename(
     match (was_tracked, now_tracked) {
         (true, true) => {
             let _ = events_tx
-                .send(TrackEvent::Moved {
+                .send(TrackEvent::Moved(TrackEventFileMove {
                     from: to_relative(&state.cwd, from),
                     to: to_relative(&state.cwd, to),
-                })
+                }))
                 .await;
         }
         (true, false) => {
             let _ = events_tx
-                .send(TrackEvent::Removed {
+                .send(TrackEvent::Removed(TrackEventFile {
                     path: to_relative(&state.cwd, from),
-                })
+                }))
                 .await;
         }
         (false, true) => {
             let _ = events_tx
-                .send(TrackEvent::Created {
+                .send(TrackEvent::Created(TrackEventFile {
                     path: to_relative(&state.cwd, to),
-                })
+                }))
                 .await;
         }
         (false, false) => {}
@@ -656,16 +672,16 @@ async fn emit_diff_events_filtered(
 
     for path in tracked_now {
         let _ = events_tx
-            .send(TrackEvent::Tracked {
+            .send(TrackEvent::Tracked(TrackEventFile {
                 path: to_relative(cwd, &path),
-            })
+            }))
             .await;
     }
     for path in untracked_now {
         let _ = events_tx
-            .send(TrackEvent::Untracked {
+            .send(TrackEvent::Untracked(TrackEventFile {
                 path: to_relative(cwd, &path),
-            })
+            }))
             .await;
     }
 }
@@ -996,8 +1012,8 @@ mod tests {
             ctx.repo,
             initial_ev("file"),
             initial_ev("file.bin"),
-            initial_ev("file.zip"),
             initial_ev("file.js"),
+            initial_ev("file.zip"),
         );
     }
 
@@ -1186,10 +1202,10 @@ mod tests {
 
         assert_eq!(
             events,
-            vec![TrackEvent::Moved {
+            vec![TrackEvent::Moved(TrackEventFileMove {
                 from: PathBuf::from("old.rs"),
                 to: PathBuf::from("new.rs"),
-            }]
+            })]
         );
         assert!(!state.tracked.contains(&ctx.repo.path().join("old.rs")));
         assert!(state.tracked.contains(&ctx.repo.path().join("new.rs")));
@@ -1266,19 +1282,19 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                TrackEvent::Created {
+                TrackEvent::Created(TrackEventFile {
                     path: PathBuf::from("extra.rs"),
-                },
-                TrackEvent::Changed {
+                }),
+                TrackEvent::Changed(TrackEventFile {
                     path: PathBuf::from("extra.rs"),
-                },
-                TrackEvent::Moved {
+                }),
+                TrackEvent::Moved(TrackEventFileMove {
                     from: PathBuf::from("main.rs"),
                     to: PathBuf::from("main2.rs"),
-                },
-                TrackEvent::Removed {
+                }),
+                TrackEvent::Removed(TrackEventFile {
                     path: PathBuf::from("extra.rs"),
-                },
+                }),
             ]
         );
     }
@@ -1300,12 +1316,12 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                TrackEvent::Tracked {
+                TrackEvent::Tracked(TrackEventFile {
                     path: PathBuf::from("c.rs"),
-                },
-                TrackEvent::Untracked {
+                }),
+                TrackEvent::Untracked(TrackEventFile {
                     path: PathBuf::from("a.rs"),
-                },
+                }),
             ]
         );
     }
@@ -1521,30 +1537,30 @@ mod tests {
     }
 
     fn initial_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::InitialTracked { path: path.into() }
+        TrackEvent::InitialTracked(TrackEventFile { path: path.into() })
     }
 
     fn changed_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Changed { path: path.into() }
+        TrackEvent::Changed(TrackEventFile { path: path.into() })
     }
 
     fn moved_ev<From: Into<PathBuf>, To: Into<PathBuf>>(from: From, to: To) -> TrackEvent {
-        TrackEvent::Moved {
+        TrackEvent::Moved(TrackEventFileMove {
             from: from.into(),
             to: to.into(),
-        }
+        })
     }
 
     fn created_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Created { path: path.into() }
+        TrackEvent::Created(TrackEventFile { path: path.into() })
     }
 
     fn tracked_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Tracked { path: path.into() }
+        TrackEvent::Tracked(TrackEventFile { path: path.into() })
     }
 
     fn untracked_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Untracked { path: path.into() }
+        TrackEvent::Untracked(TrackEventFile { path: path.into() })
     }
 
     #[macro_export]
