@@ -15,13 +15,20 @@ use notify::{
 use notify_debouncer_full::{
     DebounceEventResult, Debouncer, FileIdCache, RecommendedCache, new_debouncer,
 };
-#[cfg(feature = "source-filter")]
-use tokei::LanguageType;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
     time,
 };
+
+pub mod prelude;
+use prelude::*;
+
+mod path;
+mod track;
+
+#[cfg(feature = "source-filter")]
+mod source;
 
 #[derive(Debug, Clone)]
 pub struct WatchOptions {
@@ -58,38 +65,9 @@ impl WatchOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TrackEvent {
-    InitialTracked(TrackEventFile),
-    Tracked(TrackEventFile),
-    Untracked(TrackEventFile),
-    Created(TrackEventFile),
-    Changed(TrackEventFile),
-    Removed(TrackEventFile),
-    Moved(TrackEventFileMove),
-    Error(TrackEventError),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrackEventFile {
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrackEventFileMove {
-    pub from: PathBuf,
-    pub to: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrackEventError {
-    pub message: String,
-}
-
 #[derive(Debug)]
 pub struct FileTracker {
-    pub cwd: PathBuf,
-    pub repo_dir: Option<PathBuf>,
+    path: ProjectPath,
     command_tx: mpsc::Sender<TrackerCommand>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -98,7 +76,7 @@ pub struct FileTracker {
 #[derive(Debug)]
 enum TrackerCommand {
     IsTracked {
-        path: PathBuf,
+        path: AbsPath,
         reply: oneshot::Sender<bool>,
     },
 }
@@ -112,17 +90,16 @@ impl FileTracker {
         cwd: impl AsRef<Path>,
         options: WatchOptions,
     ) -> Result<(Self, mpsc::Receiver<TrackEvent>)> {
-        let cwd = absolute_path(cwd.as_ref()).context("failed to resolve cwd")?;
-        let repo_dir = find_repo_root(&cwd);
-        let watch_root = repo_dir.clone().unwrap_or_else(|| cwd.clone());
+        let path = ProjectPath::find(cwd.as_ref())?;
 
-        let state = TrackerState::new(cwd.clone(), watch_root, options.clone()).await?;
+        let state = TrackerState::new(path.clone(), options.clone()).await?;
 
         let (events_tx, events_rx) = mpsc::channel(state.options.event_channel_capacity);
-        for rel in sorted_rel_paths(&state.cwd, &state.tracked) {
-            let _ = events_tx
-                .send(TrackEvent::InitialTracked(TrackEventFile { path: rel }))
-                .await;
+        let ordered: BTreeSet<&AbsPath> = state.tracked.iter().collect();
+        for path in ordered {
+            let event_file = TrackEventFile::from_path(path);
+
+            let _ = events_tx.send(TrackEvent::InitialTracked(event_file)).await;
         }
 
         let (stop_tx, stop_rx) = oneshot::channel();
@@ -140,8 +117,7 @@ impl FileTracker {
 
         Ok((
             Self {
-                cwd,
-                repo_dir,
+                path,
                 command_tx,
                 stop_tx: Some(stop_tx),
                 task: Some(task),
@@ -150,21 +126,24 @@ impl FileTracker {
         ))
     }
 
-    pub async fn is_tracked(&self, path: impl AsRef<Path>) -> Result<bool> {
-        let abs = absolute_or_join(&self.cwd, path.as_ref());
-        let (reply_tx, reply_rx) = oneshot::channel();
+    pub async fn is_tracked<P: AsRef<Path>>(&self, path: P) -> Result<bool> {
+        if let Some(abs_path) = self.path.abs_path_within_cwd(path) {
+            let (reply_tx, reply_rx) = oneshot::channel();
 
-        self.command_tx
-            .send(TrackerCommand::IsTracked {
-                path: abs,
-                reply: reply_tx,
-            })
-            .await
-            .context("tracker is not running")?;
+            self.command_tx
+                .send(TrackerCommand::IsTracked {
+                    path: abs_path,
+                    reply: reply_tx,
+                })
+                .await
+                .context("tracker is not running")?;
 
-        reply_rx
-            .await
-            .context("tracker task stopped before replying")
+            reply_rx
+                .await
+                .context("tracker task stopped before replying")
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn stop(mut self) -> Result<()> {
@@ -188,14 +167,13 @@ impl Drop for FileTracker {
 
 #[derive(Debug)]
 struct TrackerState {
-    cwd: PathBuf,
-    watch_root: PathBuf,
+    project_path: ProjectPath,
     options: WatchOptions,
     ignore_filter: IgnoreFilter,
-    tracked: HashSet<PathBuf>,
-    ignore_files: HashSet<PathBuf>,
-    segment_readiness: HashMap<PathBuf, SegmentReadiness>,
-    pending_rename_from: VecDeque<PathBuf>,
+    tracked: HashSet<AbsPath>,
+    ignore_files: HashSet<AbsPath>,
+    segment_readiness: HashMap<AbsDirPath, SegmentReadiness>,
+    pending_rename_from: VecDeque<AbsPath>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,31 +183,33 @@ enum SegmentReadiness {
 }
 
 impl TrackerState {
-    async fn new(cwd: PathBuf, watch_root: PathBuf, options: WatchOptions) -> Result<Self> {
+    async fn new(project_path: ProjectPath, options: WatchOptions) -> Result<Self> {
+        let repo_path = project_path.repo_path().clone();
         let (ignore_filter, ignore_files) =
-            build_filter(&watch_root, options.app_name.as_deref()).await?;
+            build_filter(&repo_path, options.app_name.as_deref()).await?;
         let tracked =
-            scan_tracked_files(&cwd, &watch_root, &ignore_filter, options.only_source()).await?;
+            scan_tracked_files(&project_path, &ignore_filter, options.only_source()).await?;
 
         Ok(Self {
-            cwd,
-            watch_root: watch_root.clone(),
+            project_path,
             options,
             ignore_filter,
             tracked,
             ignore_files,
-            segment_readiness: HashMap::from([(watch_root.clone(), SegmentReadiness::Ready)]),
+            segment_readiness: HashMap::from([(repo_path, SegmentReadiness::Ready)]),
             pending_rename_from: VecDeque::new(),
         })
     }
 
-    async fn rebuild(&mut self) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>)> {
+    async fn rebuild(&mut self) -> Result<(HashSet<AbsPath>, HashSet<AbsPath>)> {
         let old = self.tracked.clone();
-        let (ignore_filter, ignore_files) =
-            build_filter(&self.watch_root, self.options.app_name.as_deref()).await?;
+        let (ignore_filter, ignore_files) = build_filter(
+            &self.project_path.repo_path(),
+            self.options.app_name.as_deref(),
+        )
+        .await?;
         let tracked = scan_tracked_files(
-            &self.cwd,
-            &self.watch_root,
+            &self.project_path,
             &ignore_filter,
             self.options.only_source(),
         )
@@ -246,8 +226,8 @@ impl TrackerState {
         Ok((old, tracked))
     }
 
-    fn needs_rebuild_for_query(&self, path: &Path) -> bool {
-        for segment in self.path_segments(path) {
+    fn needs_rebuild_for_query(&self, path: &AbsPath) -> bool {
+        for segment in self.project_path.dir_segments_to(path) {
             if self
                 .segment_readiness
                 .get(&segment)
@@ -260,66 +240,32 @@ impl TrackerState {
         false
     }
 
-    fn mark_path_ready(&mut self, path: &Path) {
-        for segment in self.path_segments(path) {
+    fn mark_path_ready(&mut self, path: &AbsPath) {
+        for segment in self.project_path.dir_segments_to(path) {
             self.segment_readiness
                 .insert(segment, SegmentReadiness::Ready);
         }
     }
 
     fn mark_dirty_for_ignore_change(&mut self, path: &Path) {
-        let abs = absolute_or_join(&self.watch_root, path);
-
-        if abs.to_string_lossy().ends_with(&format!(
-            "{0}.git{0}info{0}exclude",
-            std::path::MAIN_SEPARATOR
-        )) || (abs.file_name().is_some_and(|n| n == "config")
-            && abs
-                .parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|n| n == ".git"))
-        {
-            for readiness in self.segment_readiness.values_mut() {
-                *readiness = SegmentReadiness::Dirty;
-            }
-            return;
-        }
-
-        let Some(parent) = abs.parent() else {
-            return;
-        };
-
-        let parent = parent.to_path_buf();
-        for (segment, readiness) in &mut self.segment_readiness {
-            if segment.starts_with(&parent) {
-                *readiness = SegmentReadiness::Dirty;
-            }
-        }
-    }
-
-    fn path_segments(&self, path: &Path) -> Vec<PathBuf> {
-        if !path.starts_with(&self.watch_root) {
-            return Vec::new();
-        }
-
-        let mut segments = Vec::new();
-        let mut current = path.parent();
-        while let Some(dir) = current {
-            if dir.starts_with(&self.watch_root) {
-                segments.push(dir.to_path_buf());
-            } else {
-                break;
+        if let Some(abs) = self.project_path.abs_path_within_repo(path) {
+            if abs.is_git_exclude_file() || abs.is_git_config_file() {
+                for readiness in self.segment_readiness.values_mut() {
+                    *readiness = SegmentReadiness::Dirty;
+                }
+                return;
             }
 
-            if dir == self.watch_root {
-                break;
+            let Some(parent) = abs.parent() else {
+                return;
+            };
+
+            for (segment, readiness) in &mut self.segment_readiness {
+                if parent.is_or_contains(segment) {
+                    *readiness = SegmentReadiness::Dirty;
+                }
             }
-
-            current = dir.parent();
         }
-
-        segments.reverse();
-        segments
     }
 }
 
@@ -341,9 +287,10 @@ async fn run_tracker_loop(
     )
     .context("failed to create notify debouncer")?;
 
+    let repo_path_ref = state.project_path.repo_path().path_buf();
     watcher
-        .watch(&state.watch_root, RecursiveMode::Recursive)
-        .with_context(|| format!("failed to watch {}", state.watch_root.display()))?;
+        .watch(repo_path_ref, RecursiveMode::Recursive)
+        .with_context(|| format!("failed to watch {}", repo_path_ref.display()))?;
 
     let mut aux_watches = HashSet::new();
     refresh_aux_watches(&state, &mut watcher, &mut aux_watches)?;
@@ -373,7 +320,7 @@ async fn run_tracker_loop(
                         if state.needs_rebuild_for_query(&path)
                             && let Ok((old, new)) = state.rebuild().await
                         {
-                            emit_diff_events(&events_tx, &state.cwd, &old, &new).await;
+                            emit_diff_events(&events_tx,  &old, &new).await;
                             if let Err(err) = refresh_aux_watches(&state, &mut watcher, &mut aux_watches) {
                                 let _ = events_tx.send(TrackEvent::Error(TrackEventError { message: err.to_string() })).await;
                             }
@@ -411,7 +358,7 @@ async fn handle_debounced_result<W: WatchControl>(
     state: &mut TrackerState,
     events_tx: &mpsc::Sender<TrackEvent>,
     watcher: &mut W,
-    aux_watches: &mut HashSet<PathBuf>,
+    aux_watches: &mut HashSet<AbsPath>,
     debounced_result: DebounceEventResult,
 ) {
     match debounced_result {
@@ -426,13 +373,15 @@ async fn handle_debounced_result<W: WatchControl>(
                 }
 
                 for path in &event.paths {
-                    let abs = absolute_or_join(&state.watch_root, path);
-                    if abs.starts_with(&state.cwd) {
-                        touched_paths.insert(abs.clone());
-                    }
-                    if is_ignore_related_path(path, state) {
-                        state.mark_dirty_for_ignore_change(path);
-                        saw_ignore_related_change = true;
+                    if let Some(abs) = state.project_path.abs_path_within_repo(path) {
+                        if abs.is_or_within(&state.project_path.cwd_path()) {
+                            touched_paths.insert(abs.clone());
+                        }
+
+                        if state.ignore_files.contains(&abs) || abs.is_ignore_related() {
+                            state.mark_dirty_for_ignore_change(path);
+                            saw_ignore_related_change = true;
+                        }
                     }
                 }
 
@@ -445,14 +394,7 @@ async fn handle_debounced_result<W: WatchControl>(
                 time::sleep(state.options.settle_delay).await;
                 match state.rebuild().await {
                     Ok((old, new)) => {
-                        emit_diff_events_filtered(
-                            events_tx,
-                            &state.cwd,
-                            &old,
-                            &new,
-                            &touched_paths,
-                        )
-                        .await;
+                        emit_diff_events_filtered(events_tx, &old, &new, &touched_paths).await;
                         if let Err(err) = refresh_aux_watches(state, watcher, aux_watches) {
                             let _ = events_tx
                                 .send(TrackEvent::Error(TrackEventError {
@@ -494,87 +436,78 @@ async fn process_fs_event(
     ) && event.paths.len() >= 2
     {
         state.pending_rename_from.clear();
-        let from = absolute_or_join(&state.watch_root, &event.paths[0]);
-        let to = absolute_or_join(&state.watch_root, &event.paths[1]);
-        handle_rename(state, events_tx, &from, &to).await;
+        let from = state.project_path.abs_path_within_repo(&event.paths[0]);
+        let to = state.project_path.abs_path_within_repo(&event.paths[1]);
+        if let Some(from) = from
+            && let Some(to) = to
+        {
+            handle_rename(state, events_tx, &from, &to).await;
+        }
         return;
     }
 
     for path in event.paths {
-        let abs = absolute_or_join(&state.watch_root, &path);
-        if !abs.starts_with(&state.cwd) {
-            continue;
-        }
+        if let Some(abs_path) = state.project_path.abs_path_within_repo(&path) {
+            match event.kind {
+                EventKind::Remove(_) => {
+                    if state.tracked.remove(&abs_path) {
+                        let event_file = TrackEventFile::from_path(&abs_path);
+                        let _ = events_tx.send(TrackEvent::Removed(event_file)).await;
+                    }
+                }
 
-        match event.kind {
-            EventKind::Remove(_) => {
-                if state.tracked.remove(&abs) {
-                    let _ = events_tx
-                        .send(TrackEvent::Removed(TrackEventFile {
-                            path: to_relative(&state.cwd, &abs),
-                        }))
-                        .await;
+                EventKind::Create(_) => {
+                    if is_tracked_file(
+                        &state.project_path,
+                        &abs_path,
+                        &state.ignore_filter,
+                        state.options.only_source(),
+                    ) && state.tracked.insert(abs_path.clone())
+                    {
+                        let event_file = TrackEventFile::from_path(&abs_path);
+                        let _ = events_tx.send(TrackEvent::Created(event_file)).await;
+                    }
                 }
-            }
-            EventKind::Create(_) => {
-                if is_tracked_file(
-                    &state.cwd,
-                    &abs,
-                    &state.ignore_filter,
-                    state.options.only_source(),
-                ) && state.tracked.insert(abs.clone())
-                {
-                    let _ = events_tx
-                        .send(TrackEvent::Created(TrackEventFile {
-                            path: to_relative(&state.cwd, &abs),
-                        }))
-                        .await;
+
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                    if state.tracked.contains(&abs_path) {
+                        state.pending_rename_from.push_back(abs_path);
+                    }
                 }
-            }
-            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-                if state.tracked.contains(&abs) {
-                    state.pending_rename_from.push_back(abs);
+
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                    if let Some(from) = state.pending_rename_from.pop_front() {
+                        handle_rename(state, events_tx, &from, &abs_path).await;
+                    } else if is_tracked_file(
+                        &state.project_path,
+                        &abs_path,
+                        &state.ignore_filter,
+                        state.options.only_source(),
+                    ) && state.tracked.insert(abs_path.clone())
+                    {
+                        let event_file = TrackEventFile::from_path(&abs_path);
+                        let _ = events_tx.send(TrackEvent::Created(event_file)).await;
+                    }
                 }
-            }
-            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-                if let Some(from) = state.pending_rename_from.pop_front() {
-                    handle_rename(state, events_tx, &from, &abs).await;
-                } else if is_tracked_file(
-                    &state.cwd,
-                    &abs,
-                    &state.ignore_filter,
-                    state.options.only_source(),
-                ) && state.tracked.insert(abs.clone())
-                {
-                    let _ = events_tx
-                        .send(TrackEvent::Created(TrackEventFile {
-                            path: to_relative(&state.cwd, &abs),
-                        }))
-                        .await;
+
+                EventKind::Modify(_) => {
+                    if state.tracked.contains(&abs_path) {
+                        let event_file = TrackEventFile::from_path(&abs_path);
+                        let _ = events_tx.send(TrackEvent::Changed(event_file)).await;
+                    } else if is_tracked_file(
+                        &state.project_path,
+                        &abs_path,
+                        &state.ignore_filter,
+                        state.options.only_source(),
+                    ) && state.tracked.insert(abs_path.clone())
+                    {
+                        let event_file = TrackEventFile::from_path(&abs_path);
+                        let _ = events_tx.send(TrackEvent::Created(event_file)).await;
+                    }
                 }
+
+                _ => {}
             }
-            EventKind::Modify(_) => {
-                if state.tracked.contains(&abs) {
-                    let _ = events_tx
-                        .send(TrackEvent::Changed(TrackEventFile {
-                            path: to_relative(&state.cwd, &abs),
-                        }))
-                        .await;
-                } else if is_tracked_file(
-                    &state.cwd,
-                    &abs,
-                    &state.ignore_filter,
-                    state.options.only_source(),
-                ) && state.tracked.insert(abs.clone())
-                {
-                    let _ = events_tx
-                        .send(TrackEvent::Created(TrackEventFile {
-                            path: to_relative(&state.cwd, &abs),
-                        }))
-                        .await;
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -582,11 +515,8 @@ async fn process_fs_event(
 async fn flush_pending_rename_from(state: &mut TrackerState, events_tx: &mpsc::Sender<TrackEvent>) {
     while let Some(from) = state.pending_rename_from.pop_front() {
         if state.tracked.remove(&from) {
-            let _ = events_tx
-                .send(TrackEvent::Removed(TrackEventFile {
-                    path: to_relative(&state.cwd, &from),
-                }))
-                .await;
+            let event_file = TrackEventFile::from_path(&from);
+            let _ = events_tx.send(TrackEvent::Removed(event_file)).await;
         }
     }
 }
@@ -594,8 +524,8 @@ async fn flush_pending_rename_from(state: &mut TrackerState, events_tx: &mpsc::S
 async fn handle_rename(
     state: &mut TrackerState,
     events_tx: &mpsc::Sender<TrackEvent>,
-    from: &Path,
-    to: &Path,
+    from: &AbsPath,
+    to: &AbsPath,
 ) {
     if from == to {
         return;
@@ -603,38 +533,32 @@ async fn handle_rename(
 
     let was_tracked = state.tracked.remove(from);
     let now_tracked = is_tracked_file(
-        &state.cwd,
+        &state.project_path,
         to,
         &state.ignore_filter,
         state.options.only_source(),
     );
 
     if now_tracked {
-        state.tracked.insert(to.to_path_buf());
+        state.tracked.insert(to.clone());
     }
 
     match (was_tracked, now_tracked) {
         (true, true) => {
             let _ = events_tx
                 .send(TrackEvent::Moved(TrackEventFileMove {
-                    from: to_relative(&state.cwd, from),
-                    to: to_relative(&state.cwd, to),
+                    from: from.clone(),
+                    to: to.clone(),
                 }))
                 .await;
         }
         (true, false) => {
-            let _ = events_tx
-                .send(TrackEvent::Removed(TrackEventFile {
-                    path: to_relative(&state.cwd, from),
-                }))
-                .await;
+            let event_file = TrackEventFile::from_path(from);
+            let _ = events_tx.send(TrackEvent::Removed(event_file)).await;
         }
         (false, true) => {
-            let _ = events_tx
-                .send(TrackEvent::Created(TrackEventFile {
-                    path: to_relative(&state.cwd, to),
-                }))
-                .await;
+            let event_file = TrackEventFile::from_path(to);
+            let _ = events_tx.send(TrackEvent::Created(event_file)).await;
         }
         (false, false) => {}
     }
@@ -642,19 +566,17 @@ async fn handle_rename(
 
 async fn emit_diff_events(
     events_tx: &mpsc::Sender<TrackEvent>,
-    cwd: &Path,
-    old: &HashSet<PathBuf>,
-    new: &HashSet<PathBuf>,
+    old: &HashSet<AbsPath>,
+    new: &HashSet<AbsPath>,
 ) {
-    emit_diff_events_filtered(events_tx, cwd, old, new, &HashSet::new()).await;
+    emit_diff_events_filtered(events_tx, old, new, &HashSet::new()).await;
 }
 
 async fn emit_diff_events_filtered(
     events_tx: &mpsc::Sender<TrackEvent>,
-    cwd: &Path,
-    old: &HashSet<PathBuf>,
-    new: &HashSet<PathBuf>,
-    ignored_paths: &HashSet<PathBuf>,
+    old: &HashSet<AbsPath>,
+    new: &HashSet<AbsPath>,
+    ignored_paths: &HashSet<AbsPath>,
 ) {
     let mut tracked_now = BTreeSet::new();
     let mut untracked_now = BTreeSet::new();
@@ -671,54 +593,50 @@ async fn emit_diff_events_filtered(
     }
 
     for path in tracked_now {
-        let _ = events_tx
-            .send(TrackEvent::Tracked(TrackEventFile {
-                path: to_relative(cwd, &path),
-            }))
-            .await;
+        let event_file = TrackEventFile::from_path(&path);
+        let _ = events_tx.send(TrackEvent::Tracked(event_file)).await;
     }
+
     for path in untracked_now {
-        let _ = events_tx
-            .send(TrackEvent::Untracked(TrackEventFile {
-                path: to_relative(cwd, &path),
-            }))
-            .await;
+        let event_file = TrackEventFile::from_path(&path);
+        let _ = events_tx.send(TrackEvent::Untracked(event_file)).await;
     }
 }
 
 fn refresh_aux_watches(
     state: &TrackerState,
     watcher: &mut impl WatchControl,
-    aux_watches: &mut HashSet<PathBuf>,
+    aux_watches: &mut HashSet<AbsPath>,
 ) -> Result<()> {
     let mut wanted = HashSet::new();
 
     for ignore_file in &state.ignore_files {
-        if ignore_file.starts_with(&state.watch_root) {
+        if state.project_path.repo_path().is_or_contains(ignore_file) {
             continue;
         }
-        if ignore_file.exists() {
+
+        if ignore_file.path_buf().exists() {
             wanted.insert(ignore_file.clone());
         } else if let Some(parent) = ignore_file.parent() {
-            wanted.insert(parent.to_path_buf());
+            wanted.insert(parent.to_abs_path());
         }
     }
 
-    for path in aux_watches.clone() {
-        if !wanted.contains(&path) {
-            let _ = watcher.unwatch(&path);
-            aux_watches.remove(&path);
+    for abs_path in aux_watches.clone() {
+        if !wanted.contains(&abs_path) {
+            let _ = watcher.unwatch(abs_path.path());
+            aux_watches.remove(&abs_path);
         }
     }
 
-    for path in wanted {
-        if aux_watches.contains(&path) {
+    for abs_path in wanted {
+        if aux_watches.contains(&abs_path) {
             continue;
         }
         watcher
-            .watch(&path, RecursiveMode::NonRecursive)
-            .with_context(|| format!("failed to watch aux path {}", path.display()))?;
-        aux_watches.insert(path);
+            .watch(abs_path.path(), RecursiveMode::NonRecursive)
+            .with_context(|| format!("failed to watch aux path {}", abs_path.path().display()))?;
+        aux_watches.insert(abs_path);
     }
 
     Ok(())
@@ -749,37 +667,10 @@ impl<C: FileIdCache> WatchControl for Debouncer<RecommendedWatcher, C> {
     }
 }
 
-fn is_ignore_related_path(path: &Path, state: &TrackerState) -> bool {
-    let abs = absolute_or_join(&state.watch_root, path);
-    if state.ignore_files.contains(&abs) {
-        return true;
-    }
-
-    if abs
-        .file_name()
-        .is_some_and(|name| name == ".ignore" || name == ".gitignore" || name == ".hgignore")
-    {
-        return true;
-    }
-
-    if abs.to_string_lossy().ends_with(&format!(
-        "{0}.git{0}info{0}exclude",
-        std::path::MAIN_SEPARATOR
-    )) {
-        return true;
-    }
-
-    abs.file_name().is_some_and(|n| n == "config")
-        && abs
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n == ".git")
-}
-
 async fn build_filter(
-    watch_root: &Path,
+    watch_root: &AbsDirPath,
     app_name: Option<&str>,
-) -> Result<(IgnoreFilter, HashSet<PathBuf>)> {
+) -> Result<(IgnoreFilter, HashSet<AbsPath>)> {
     let watch_root = watch_root.to_path_buf();
     let app_name = app_name.map(ToOwned::to_owned);
 
@@ -794,9 +685,12 @@ async fn build_filter(
             let (mut global, _) = from_environment(app_name.as_deref()).await;
             local.append(&mut global);
 
-            let ignore_files: HashSet<PathBuf> = local.iter().map(|f| f.path.clone()).collect();
+            let ignore_files: HashSet<AbsPath> = local
+                .iter()
+                .map(|f| AbsPath::try_new(f.path.clone()).unwrap())
+                .collect();
             let filter = IgnoreFilter::new(&watch_root, &local).await?;
-            Ok::<(IgnoreFilter, HashSet<PathBuf>), anyhow::Error>((filter, ignore_files))
+            Ok::<(IgnoreFilter, HashSet<AbsPath>), anyhow::Error>((filter, ignore_files))
         })
     })
     .await
@@ -804,12 +698,11 @@ async fn build_filter(
 }
 
 async fn scan_tracked_files(
-    cwd: &Path,
-    watch_root: &Path,
+    project_path: &ProjectPath,
     filter: &IgnoreFilter,
     only_source: bool,
-) -> Result<HashSet<PathBuf>> {
-    let root = watch_root.to_path_buf();
+) -> Result<HashSet<AbsPath>> {
+    let root = project_path.cwd_path().to_path_buf();
 
     let candidates: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
         let mut builder = WalkBuilder::new(&root);
@@ -849,95 +742,33 @@ async fn scan_tracked_files(
 
     let mut tracked = HashSet::new();
     for path in candidates {
-        if is_tracked_file(cwd, &path, filter, only_source) {
-            tracked.insert(path);
+        let abs_path = AbsPath::try_new(path)?;
+        if is_tracked_file(project_path, &abs_path, filter, only_source) {
+            tracked.insert(abs_path);
         }
     }
 
     Ok(tracked)
 }
 
-fn is_tracked_file(cwd: &Path, path: &Path, filter: &IgnoreFilter, only_source: bool) -> bool {
-    if !path.starts_with(cwd) {
+fn is_tracked_file(
+    project_path: &ProjectPath,
+    path: &AbsPath,
+    filter: &IgnoreFilter,
+    only_source: bool,
+) -> bool {
+    if !project_path.is_project_file(&path) {
         return false;
     }
 
-    if !path.is_file() {
+    if only_source && !path.is_source_file() {
         return false;
     }
 
-    if path.components().any(|component| {
-        component.as_os_str().to_str().is_some_and(|part| {
-            matches!(
-                part,
-                ".git" | ".hg" | ".svn" | "_darcs" | ".bzr" | ".fossil-settings"
-            )
-        })
-    }) {
-        return false;
-    }
-
-    if only_source && !is_source_file(path) {
-        return false;
-    }
-
-    match filter.match_path(path, false) {
+    match filter.match_path(path.path_buf(), false) {
         Match::None | Match::Whitelist(_) => true,
-        Match::Ignore(glob) => !glob.from().is_none_or(|f| path.starts_with(f)),
+        Match::Ignore(glob) => !path.matches_glob(glob),
     }
-}
-
-fn is_source_file(path: &Path) -> bool {
-    #[cfg(feature = "source-filter")]
-    {
-        LanguageType::from_path(path, &tokei::Config::default()).is_some()
-    }
-
-    #[cfg(not(feature = "source-filter"))]
-    {
-        let _ = path;
-        false
-    }
-}
-
-fn to_relative(cwd: &Path, abs: &Path) -> PathBuf {
-    abs.strip_prefix(cwd).unwrap_or(abs).to_path_buf()
-}
-
-fn sorted_rel_paths(cwd: &Path, paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut ordered: BTreeSet<PathBuf> = BTreeSet::new();
-    for path in paths {
-        ordered.insert(to_relative(cwd, path));
-    }
-    ordered.into_iter().collect()
-}
-
-fn absolute_or_join(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
-}
-
-fn absolute_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
-}
-
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        let git_marker = dir.join(".git");
-        if git_marker.exists() {
-            return Some(dir.to_path_buf());
-        }
-        current = dir.parent();
-    }
-    None
 }
 
 #[cfg(test)]
@@ -960,8 +791,9 @@ mod tests {
 
         let nested = repo.path().join("a/b/c");
         fs::create_dir_all(&nested).unwrap();
-        let found = find_repo_root(&nested).unwrap();
-        assert_eq!(found, repo.path().to_path_buf());
+
+        let project_path = ProjectPath::find(&nested).unwrap();
+        assert_eq!(project_path.repo_path().path(), repo.path());
     }
 
     #[cfg(feature = "source-filter")]
@@ -974,9 +806,9 @@ mod tests {
         ctx.repo.start().await;
         assert_events!(
             ctx.repo,
-            initial_ev("file"),
-            initial_ev("file.bin"),
-            initial_ev("file.js"),
+            ctx.fac.initial_ev("file"),
+            ctx.fac.initial_ev("file.bin"),
+            ctx.fac.initial_ev("file.js"),
         );
     }
 
@@ -993,7 +825,7 @@ mod tests {
                 ..WatchOptions::default()
             })
             .await;
-        assert_events!(ctx.repo, initial_ev("file.js"),);
+        assert_events!(ctx.repo, ctx.fac.initial_ev("file.js"),);
     }
 
     #[cfg(not(feature = "source-filter"))]
@@ -1010,10 +842,10 @@ mod tests {
         ctx.repo.start().await;
         assert_events!(
             ctx.repo,
-            initial_ev("file"),
-            initial_ev("file.bin"),
-            initial_ev("file.js"),
-            initial_ev("file.zip"),
+            ctx.fac.initial_ev("file"),
+            ctx.fac.initial_ev("file.bin"),
+            ctx.fac.initial_ev("file.js"),
+            ctx.fac.initial_ev("file.zip"),
         );
     }
 
@@ -1031,9 +863,9 @@ mod tests {
         ctx.repo.start().await;
         assert_events!(
             ctx.repo,
-            initial_ev(".gitignore"),
-            initial_ev("root.rs"),
-            initial_ev("src/lib.rs"),
+            ctx.fac.initial_ev(".gitignore"),
+            ctx.fac.initial_ev("root.rs"),
+            ctx.fac.initial_ev("src/lib.rs"),
         );
     }
 
@@ -1049,7 +881,7 @@ mod tests {
                 ..WatchOptions::default()
             })
             .await;
-        assert_events!(ctx.repo, initial_ev("main.rs"),);
+        assert_events!(ctx.repo, ctx.fac.initial_ev("main.rs"),);
     }
 
     #[test_context(RepoContext)]
@@ -1062,13 +894,17 @@ mod tests {
         ]);
 
         ctx.repo.start().await;
-        assert_events!(ctx.repo, initial_ev(".gitignore"), initial_ev("tracked.rs"),);
+        assert_events!(
+            ctx.repo,
+            ctx.fac.initial_ev(".gitignore"),
+            ctx.fac.initial_ev("tracked.rs"),
+        );
 
         ctx.repo.write(".gitignore", "");
         assert_events!(
             ctx.repo,
-            changed_ev(".gitignore"),
-            tracked_ev("ignored.txt"),
+            ctx.fac.changed_ev(".gitignore"),
+            ctx.fac.tracked_ev("ignored.txt"),
         );
     }
 
@@ -1081,14 +917,14 @@ mod tests {
             ("app/main.rs", "fn main() {}\n"),
         ]);
 
-        ctx.repo.start_at("app").await;
-        assert_events!(ctx.repo, initial_ev("a.log"), initial_ev("main.rs"),);
+        let fac = ctx.repo.start_at("app").await;
+        assert_events!(ctx.repo, fac.initial_ev("a.log"), fac.initial_ev("main.rs"),);
 
         ctx.repo.write(".gitignore", "*.log\n");
-        assert_events!(ctx.repo, untracked_ev("a.log"),);
+        assert_events!(ctx.repo, fac.untracked_ev("a.log"),);
 
         ctx.repo.write(".gitignore", "");
-        assert_events!(ctx.repo, tracked_ev("a.log"),);
+        assert_events!(ctx.repo, fac.tracked_ev("a.log"),);
     }
 
     #[test_context(RepoContext)]
@@ -1100,11 +936,11 @@ mod tests {
         ]);
         ctx.repo.set_excludes_file("global-excludes");
 
-        ctx.repo.start_at("app").await;
+        let fac = ctx.repo.start_at("app").await;
         assert_events!(ctx.repo);
 
         ctx.repo.write("global-excludes", "");
-        assert_events!(ctx.repo, tracked_ev("global.txt"),);
+        assert_events!(ctx.repo, fac.tracked_ev("global.txt"),);
     }
 
     #[test_context(RepoContext)]
@@ -1117,11 +953,15 @@ mod tests {
         ]);
 
         ctx.repo.start().await;
-        assert_events!(ctx.repo, initial_ev(".gitignore"), initial_ev("tracked.rs"),);
+        assert_events!(
+            ctx.repo,
+            ctx.fac.initial_ev(".gitignore"),
+            ctx.fac.initial_ev("tracked.rs"),
+        );
 
         ctx.repo.rename("tracked.rs", "moved.rs");
         ctx.repo.rename("a.ignored.txt", "b.ignored.txt");
-        assert_events!(ctx.repo, moved_ev("tracked.rs", "moved.rs"),);
+        assert_events!(ctx.repo, ctx.fac.moved_ev("tracked.rs", "moved.rs"),);
     }
 
     #[test_context(RepoContext)]
@@ -1131,11 +971,19 @@ mod tests {
             .write_all(vec![("a.txt", "Hello"), ("b.txt", "Hello")]);
 
         ctx.repo.start().await;
-        assert_events!(ctx.repo, initial_ev("a.txt"), initial_ev("b.txt"),);
+        assert_events!(
+            ctx.repo,
+            ctx.fac.initial_ev("a.txt"),
+            ctx.fac.initial_ev("b.txt"),
+        );
 
         ctx.repo.write("a.txt", "Hello, world!");
         ctx.repo.write("b.txt", "Hello, world!");
-        assert_events!(ctx.repo, changed_ev("a.txt"), changed_ev("b.txt"),);
+        assert_events!(
+            ctx.repo,
+            ctx.fac.changed_ev("a.txt"),
+            ctx.fac.changed_ev("b.txt"),
+        );
     }
 
     #[test_context(RepoContext)]
@@ -1150,9 +998,9 @@ mod tests {
         ctx.repo.start().await;
         assert_events!(
             ctx.repo,
-            initial_ev("a.txt"),
-            initial_ev("b.txt"),
-            initial_ev("c.txt"),
+            ctx.fac.initial_ev("a.txt"),
+            ctx.fac.initial_ev("b.txt"),
+            ctx.fac.initial_ev("c.txt"),
         );
 
         ctx.repo.write("a.txt", "Hello,");
@@ -1164,7 +1012,11 @@ mod tests {
         ctx.repo.rename("b.txt", "b3.txt");
         ctx.repo.rename("c.txt", "c2.txt");
         ctx.repo.rename("c2.txt", "c.txt");
-        assert_events!(ctx.repo, changed_ev("a.txt"), moved_ev("b.txt", "b3.txt"),);
+        assert_events!(
+            ctx.repo,
+            ctx.fac.changed_ev("a.txt"),
+            ctx.fac.moved_ev("b.txt", "b3.txt"),
+        );
     }
 
     #[test_context(RepoContext)]
@@ -1173,7 +1025,7 @@ mod tests {
         ctx.repo.write("old.rs", "pub fn old() {}\n");
         ctx.repo.write("new.rs", "pub fn new() {}\n");
 
-        let (mut state, _ignore_files) = tracker_state_for(ctx.repo.path()).await;
+        let (mut state, _ignore_files, fac) = tracker_state_for(ctx.repo.path()).await;
         let (events_tx, mut events_rx) = mpsc::channel(16);
 
         process_fs_event(
@@ -1200,15 +1052,9 @@ mod tests {
 
         let events = collect_all_events(&mut events_rx).await;
 
-        assert_eq!(
-            events,
-            vec![TrackEvent::Moved(TrackEventFileMove {
-                from: PathBuf::from("old.rs"),
-                to: PathBuf::from("new.rs"),
-            })]
-        );
-        assert!(!state.tracked.contains(&ctx.repo.path().join("old.rs")));
-        assert!(state.tracked.contains(&ctx.repo.path().join("new.rs")));
+        assert_eq!(events, vec![fac.moved_ev("old.rs", "new.rs"),]);
+        assert!(!state.tracked.contains(&fac.abs_path("old.rs")));
+        assert!(state.tracked.contains(&fac.abs_path("new.rs")));
     }
 
     #[test_context(RepoContext)]
@@ -1219,7 +1065,7 @@ mod tests {
             ("new.rs", "pub fn new() {}\n"),
         ]);
 
-        let (mut state, _ignore_files) = tracker_state_for(ctx.repo.path()).await;
+        let (mut state, _ignore_files, fac) = tracker_state_for(ctx.repo.path()).await;
         let (events_tx, mut events_rx) = mpsc::channel(16);
 
         ctx.repo.write("extra.rs", "pub fn extra() {}\n");
@@ -1282,19 +1128,10 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                TrackEvent::Created(TrackEventFile {
-                    path: PathBuf::from("extra.rs"),
-                }),
-                TrackEvent::Changed(TrackEventFile {
-                    path: PathBuf::from("extra.rs"),
-                }),
-                TrackEvent::Moved(TrackEventFileMove {
-                    from: PathBuf::from("main.rs"),
-                    to: PathBuf::from("main2.rs"),
-                }),
-                TrackEvent::Removed(TrackEventFile {
-                    path: PathBuf::from("extra.rs"),
-                }),
+                fac.created_ev("extra.rs"),
+                fac.changed_ev("extra.rs"),
+                fac.moved_ev("main.rs", "main2.rs"),
+                fac.removed_ev("extra.rs"),
             ]
         );
     }
@@ -1304,25 +1141,16 @@ mod tests {
     async fn test_emit_diff_events_emits_exact_tracking_transitions(ctx: &mut RepoContext) {
         let (events_tx, mut events_rx) = mpsc::channel(16);
 
-        let old: HashSet<PathBuf> =
-            [ctx.repo.path().join("a.rs"), ctx.repo.path().join("b.rs")].into();
-        let new: HashSet<PathBuf> =
-            [ctx.repo.path().join("b.rs"), ctx.repo.path().join("c.rs")].into();
+        let old: HashSet<AbsPath> = [ctx.fac.abs_path("a.rs"), ctx.fac.abs_path("b.rs")].into();
+        let new: HashSet<AbsPath> = [ctx.fac.abs_path("b.rs"), ctx.fac.abs_path("c.rs")].into();
 
-        emit_diff_events(&events_tx, ctx.repo.path(), &old, &new).await;
+        emit_diff_events(&events_tx, &old, &new).await;
 
         let events = collect_all_events(&mut events_rx).await;
 
         assert_eq!(
             events,
-            vec![
-                TrackEvent::Tracked(TrackEventFile {
-                    path: PathBuf::from("c.rs"),
-                }),
-                TrackEvent::Untracked(TrackEventFile {
-                    path: PathBuf::from("a.rs"),
-                }),
-            ]
+            vec![ctx.fac.tracked_ev("c.rs"), ctx.fac.untracked_ev("a.rs"),]
         );
     }
 
@@ -1345,24 +1173,24 @@ mod tests {
         ctx.repo.start().await;
         assert_events!(
             ctx.repo,
-            initial_ev(".gitignore"),
-            initial_ev("path/to/a.txt"),
-            initial_ev("path/to/b.txt"),
-            initial_ev("path/to/c.txt"),
-            initial_ev("path/to/file/.gitignore"),
-            initial_ev("path/to/file/b.txt"),
-            initial_ev("path/to/file/c.txt"),
+            ctx.fac.initial_ev(".gitignore"),
+            ctx.fac.initial_ev("path/to/a.txt"),
+            ctx.fac.initial_ev("path/to/b.txt"),
+            ctx.fac.initial_ev("path/to/c.txt"),
+            ctx.fac.initial_ev("path/to/file/.gitignore"),
+            ctx.fac.initial_ev("path/to/file/b.txt"),
+            ctx.fac.initial_ev("path/to/file/c.txt"),
         );
 
         ctx.repo
             .write("path/to/.gitignore", "a.txt\n/b.txt\nc.txt\n");
         assert_events!(
             ctx.repo,
-            created_ev("path/to/.gitignore"),
-            untracked_ev("path/to/a.txt"),
-            untracked_ev("path/to/b.txt"),
-            untracked_ev("path/to/c.txt"),
-            untracked_ev("path/to/file/c.txt"),
+            ctx.fac.created_ev("path/to/.gitignore"),
+            ctx.fac.untracked_ev("path/to/a.txt"),
+            ctx.fac.untracked_ev("path/to/b.txt"),
+            ctx.fac.untracked_ev("path/to/c.txt"),
+            ctx.fac.untracked_ev("path/to/file/c.txt"),
         );
     }
 
@@ -1398,17 +1226,20 @@ mod tests {
         out
     }
 
-    async fn tracker_state_for(path: &Path) -> (TrackerState, HashSet<PathBuf>) {
+    async fn tracker_state_for(path: &Path) -> (TrackerState, HashSet<AbsPath>, TestFactory) {
         let watch_root = path.to_path_buf();
-        let (filter, ignore_files) = build_filter(&watch_root, None).await.unwrap();
-        let tracked = scan_tracked_files(path, &watch_root, &filter, false)
+        let project_path = ProjectPath::find(&watch_root).unwrap();
+        let (filter, ignore_files) = build_filter(&project_path.repo_path(), None).await.unwrap();
+        let tracked = scan_tracked_files(&project_path, &filter, false)
             .await
             .unwrap();
+        let fac = TestFactory {
+            project_path: project_path.clone(),
+        };
 
         (
             TrackerState {
-                cwd: watch_root.clone(),
-                watch_root,
+                project_path,
                 options: WatchOptions::default(),
                 ignore_filter: filter,
                 tracked,
@@ -1417,17 +1248,20 @@ mod tests {
                 pending_rename_from: VecDeque::new(),
             },
             ignore_files,
+            fac,
         )
     }
 
     struct RepoContext {
         repo: TestRepo,
+        fac: TestFactory,
     }
 
     impl AsyncTestContext for RepoContext {
         async fn setup() -> RepoContext {
             let repo = TestRepo::new();
-            RepoContext { repo }
+            let fac = TestFactory::new(&repo);
+            RepoContext { repo, fac }
         }
 
         async fn teardown(self) {
@@ -1503,9 +1337,11 @@ mod tests {
             self.start_with_options(Default::default()).await;
         }
 
-        async fn start_at(&mut self, cwd: &str) {
+        async fn start_at(&mut self, cwd: &str) -> TestFactory {
             self.cwd = self.cwd.join(cwd);
+            let fac = TestFactory::new(self);
             self.start().await;
+            fac
         }
 
         async fn start_with_options(&mut self, options: WatchOptions) {
@@ -1536,31 +1372,58 @@ mod tests {
         }
     }
 
-    fn initial_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::InitialTracked(TrackEventFile { path: path.into() })
+    struct TestFactory {
+        project_path: ProjectPath,
     }
 
-    fn changed_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Changed(TrackEventFile { path: path.into() })
-    }
+    impl TestFactory {
+        pub fn new(repo: &TestRepo) -> Self {
+            let project_path = ProjectPath::find(repo.path()).unwrap();
+            Self { project_path }
+        }
 
-    fn moved_ev<From: Into<PathBuf>, To: Into<PathBuf>>(from: From, to: To) -> TrackEvent {
-        TrackEvent::Moved(TrackEventFileMove {
-            from: from.into(),
-            to: to.into(),
-        })
-    }
+        pub fn abs_path<P: Into<PathBuf>>(&self, path: P) -> AbsPath {
+            self.project_path.abs_path_within_cwd(path.into()).unwrap()
+        }
 
-    fn created_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Created(TrackEventFile { path: path.into() })
-    }
+        pub fn event_file<P: Into<PathBuf>>(&self, path: P) -> TrackEventFile {
+            TrackEventFile::from_path(&self.abs_path(path))
+        }
 
-    fn tracked_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Tracked(TrackEventFile { path: path.into() })
-    }
+        pub fn initial_ev<P: Into<PathBuf>>(&self, path: P) -> TrackEvent {
+            TrackEvent::InitialTracked(self.event_file(path))
+        }
 
-    fn untracked_ev<Path: Into<PathBuf>>(path: Path) -> TrackEvent {
-        TrackEvent::Untracked(TrackEventFile { path: path.into() })
+        pub fn changed_ev<P: Into<PathBuf>>(&self, path: P) -> TrackEvent {
+            TrackEvent::Changed(self.event_file(path))
+        }
+
+        pub fn moved_ev<From: Into<PathBuf>, To: Into<PathBuf>>(
+            &self,
+            from: From,
+            to: To,
+        ) -> TrackEvent {
+            TrackEvent::Moved(TrackEventFileMove {
+                from: self.abs_path(from),
+                to: self.abs_path(to),
+            })
+        }
+
+        pub fn removed_ev<P: Into<PathBuf>>(&self, path: P) -> TrackEvent {
+            TrackEvent::Removed(self.event_file(path))
+        }
+
+        pub fn created_ev<Path: Into<PathBuf>>(&self, path: Path) -> TrackEvent {
+            TrackEvent::Created(self.event_file(path))
+        }
+
+        pub fn tracked_ev<Path: Into<PathBuf>>(&self, path: Path) -> TrackEvent {
+            TrackEvent::Tracked(self.event_file(path))
+        }
+
+        pub fn untracked_ev<Path: Into<PathBuf>>(&self, path: Path) -> TrackEvent {
+            TrackEvent::Untracked(self.event_file(path))
+        }
     }
 
     #[macro_export]
