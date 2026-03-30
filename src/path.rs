@@ -41,8 +41,8 @@ impl ProjectPath {
     }
 
     /// Returns the repo path.
-    pub fn repo_path(&self) -> &AbsDirPath {
-        self.repo_path.abs_dir_path()
+    pub fn repo_path(&self) -> &RepoPath {
+        &self.repo_path
     }
 
     /// Checks if the given path is a project file, meaning it is a file within the cwd, not within
@@ -115,7 +115,7 @@ pub struct RepoPath {
 impl RepoPath {
     /// Finds the repo path by searching for the `.git` marker starting from the given cwd and
     /// moving upwards until the marker is found or the root is reached.
-    fn find(cwd_path: &AbsDirPath) -> Result<RepoPath> {
+    pub fn find(cwd_path: &AbsDirPath) -> Result<RepoPath> {
         let mut current = Some(cwd_path.abs_path.path_buf.as_path());
         while let Some(dir) = current {
             let git_marker = dir.join(GIT_MARKER);
@@ -133,8 +133,22 @@ impl RepoPath {
     }
 
     /// Returns the absolute dir path of the repo root.
-    fn abs_dir_path(&self) -> &AbsDirPath {
+    pub fn abs_dir_path(&self) -> &AbsDirPath {
         &self.abs_dir_path
+    }
+}
+
+impl AbsPathLike for RepoPath {
+    /// Returns the path buf as a reference.
+    fn abs_path(&self) -> &AbsPath {
+        &self.abs_dir_path.abs_path
+    }
+}
+
+impl PathLike for RepoPath {
+    /// Returns the AbsDirPath buf as a reference.
+    fn path_buf(&self) -> &PathBuf {
+        &self.abs_dir_path.abs_path.path_buf
     }
 }
 
@@ -145,26 +159,6 @@ pub struct AbsDirPath {
 }
 
 impl AbsDirPath {
-    /// Returns the path buf as a reference.
-    pub fn path_buf(&self) -> &PathBuf {
-        self.abs_path.path_buf()
-    }
-
-    /// Returns the path buf as a reference.
-    pub fn path(&self) -> &Path {
-        self.abs_path.path()
-    }
-
-    /// Returns the absolute path as a `PathBuf`.
-    pub fn to_path_buf(&self) -> PathBuf {
-        self.abs_path.path_buf.clone()
-    }
-
-    /// Return the absolute path as an `AbsPath`.
-    pub fn to_abs_path(&self) -> AbsPath {
-        self.abs_path.clone()
-    }
-
     /// Checks if the given path is or within the dir path.
     pub fn is_or_contains<P: AsRef<AbsPath>>(&self, path: P) -> bool {
         let path = path.as_ref();
@@ -174,6 +168,20 @@ impl AbsDirPath {
     /// Returns the parent dir path of this absolute path if it exists.
     pub fn parent(&self) -> Option<AbsDirPath> {
         self.abs_path.parent()
+    }
+}
+
+impl AbsPathLike for AbsDirPath {
+    /// Returns the path buf as a reference.
+    fn abs_path(&self) -> &AbsPath {
+        &self.abs_path
+    }
+}
+
+impl PathLike for AbsDirPath {
+    /// Returns the AbsDirPath buf as a reference.
+    fn path_buf(&self) -> &PathBuf {
+        &self.abs_path.path_buf
     }
 }
 
@@ -250,11 +258,6 @@ impl AbsPath {
         &self.path_buf
     }
 
-    /// Returns the path buf as a reference.
-    pub fn path(&self) -> &Path {
-        self.path_buf.as_path()
-    }
-
     /// Checks if the path is or within a SCM dir.
     pub fn is_scm_path(&self) -> bool {
         self.path_buf.components().any(|component| {
@@ -321,6 +324,20 @@ impl AbsPath {
     }
 }
 
+impl AbsPathLike for AbsPath {
+    /// Returns the path buf as a reference.
+    fn abs_path(&self) -> &AbsPath {
+        self
+    }
+}
+
+impl PathLike for AbsPath {
+    /// Returns the path buf as a reference.
+    fn path_buf(&self) -> &PathBuf {
+        &self.path_buf
+    }
+}
+
 impl AsRef<AbsPath> for AbsPath {
     fn as_ref(&self) -> &AbsPath {
         self
@@ -340,3 +357,28 @@ impl PartialEq for AbsPath {
 }
 
 impl Eq for AbsPath {}
+
+pub trait AbsPathLike {
+    /// Returns the absolute path as a reference.
+    fn abs_path(&self) -> &AbsPath;
+
+    /// Returns the absolute path clone.
+    fn to_abs_path(&self) -> AbsPath {
+        self.abs_path().clone()
+    }
+}
+
+pub trait PathLike {
+    /// Returns the path buf as a reference.
+    fn path_buf(&self) -> &PathBuf;
+
+    /// Returns the path buf clone.
+    fn to_path_buf(&self) -> PathBuf {
+        self.path_buf().clone()
+    }
+
+    /// Returns the path as a reference.
+    fn path(&self) -> &Path {
+        self.path_buf().as_path()
+    }
+}

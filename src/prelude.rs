@@ -5,7 +5,7 @@ pub use crate::source::SourceLang;
 
 pub use crate::track::{TrackEvent, TrackEventError, TrackEventFile, TrackEventFileMove};
 
-pub use crate::path::{AbsDirPath, AbsPath, ProjectPath, RepoPath};
+pub use crate::path::{AbsDirPath, AbsPath, AbsPathLike, PathLike, ProjectPath, RepoPath};
 
 pub(crate) mod internal {
     pub use anyhow::Context;

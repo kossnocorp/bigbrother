@@ -196,7 +196,10 @@ impl TrackerState {
             ignore_filter,
             tracked,
             ignore_files,
-            segment_readiness: HashMap::from([(repo_path, SegmentReadiness::Ready)]),
+            segment_readiness: HashMap::from([(
+                repo_path.abs_dir_path().clone(),
+                SegmentReadiness::Ready,
+            )]),
             pending_rename_from: VecDeque::new(),
         })
     }
@@ -413,6 +416,7 @@ async fn handle_debounced_result<W: WatchControl>(
                 }
             }
         }
+
         Err(errors) => {
             for err in errors {
                 let _ = events_tx
@@ -611,7 +615,12 @@ fn refresh_aux_watches(
     let mut wanted = HashSet::new();
 
     for ignore_file in &state.ignore_files {
-        if state.project_path.repo_path().is_or_contains(ignore_file) {
+        if state
+            .project_path
+            .repo_path()
+            .abs_dir_path()
+            .is_or_contains(ignore_file)
+        {
             continue;
         }
 
@@ -668,7 +677,7 @@ impl<C: FileIdCache> WatchControl for Debouncer<RecommendedWatcher, C> {
 }
 
 async fn build_filter(
-    watch_root: &AbsDirPath,
+    watch_root: &RepoPath,
     app_name: Option<&str>,
 ) -> Result<(IgnoreFilter, HashSet<AbsPath>)> {
     let watch_root = watch_root.to_path_buf();
@@ -699,7 +708,7 @@ async fn build_filter(
 
 async fn scan_tracked_files(
     project_path: &ProjectPath,
-    filter: &IgnoreFilter,
+    ignore_filter: &IgnoreFilter,
     only_source: bool,
 ) -> Result<HashSet<AbsPath>> {
     let root = project_path.cwd_path().to_path_buf();
@@ -743,7 +752,7 @@ async fn scan_tracked_files(
     let mut tracked = HashSet::new();
     for path in candidates {
         let abs_path = AbsPath::try_new(path)?;
-        if is_tracked_file(project_path, &abs_path, filter, only_source) {
+        if is_tracked_file(project_path, &abs_path, ignore_filter, only_source) {
             tracked.insert(abs_path);
         }
     }
@@ -1229,8 +1238,9 @@ mod tests {
     async fn tracker_state_for(path: &Path) -> (TrackerState, HashSet<AbsPath>, TestFactory) {
         let watch_root = path.to_path_buf();
         let project_path = ProjectPath::find(&watch_root).unwrap();
-        let (filter, ignore_files) = build_filter(&project_path.repo_path(), None).await.unwrap();
-        let tracked = scan_tracked_files(&project_path, &filter, false)
+        let (ignore_filter, ignore_files) =
+            build_filter(&project_path.repo_path(), None).await.unwrap();
+        let tracked = scan_tracked_files(&project_path, &ignore_filter, false)
             .await
             .unwrap();
         let fac = TestFactory {
@@ -1241,7 +1251,7 @@ mod tests {
             TrackerState {
                 project_path,
                 options: WatchOptions::default(),
-                ignore_filter: filter,
+                ignore_filter,
                 tracked,
                 ignore_files: ignore_files.clone(),
                 segment_readiness: HashMap::new(),
